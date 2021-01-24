@@ -1,0 +1,34 @@
+#+TITLE: Notes
+
+
+* Considerations
+** Don't care about machines < 4GiB of RAM
+** Fuck legacy
+* Kernel
+** PXE boot
+** UEFI kernel for mmap and stdout
+*** UEFI skips initial setup proc, switches to kernel immediately
+** Non-shared memory
+*** rust-style kernel
+*** mem shared only if RO
+*** mutable mem exclusive to 1 core (no locks)
+*** TLB shootdowns
+*** soft reboots via bootloader
+
+* Build
+** Rust -> Cargo -> Binary
+
+* System
+** Reset ->
+** INIT reg state ->
+** BIOS loads 1st sector and jump to it ->
+** UEFI firmware ->
+** Download PE ->
+** Load PE ->
+** PE entry 64-bit long mode with a small identity map ->
+*** identity map sets vmmap to map same location as pmmap
+** Use UEFI to get memmap and display stdout ->
+** Create page table for each core ->
+** Reload kernel int table for each core ->
+** Jump into bootstrapped kernel entry point for each core ->
+*** gives us control over kernel reset (similar to linux nested kernel loading)
