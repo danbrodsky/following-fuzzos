@@ -103,7 +103,7 @@ pub fn get_memory_map(_image_handle: EfiHandle) {
 
     if st.is_null() {return;}
 
-    let mut memory_map = [0u8; 6 * 1024];
+    let mut memory_map = [0u8; 8 * 1024];
     let mut free_memory = 0u64;
     unsafe {
         let mut size = core::mem::size_of_val(&memory_map);

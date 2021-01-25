@@ -6,6 +6,7 @@ cargo build
 qemu-system-x86_64 \
   -enable-kvm \
   -m 512 \
+  -smp 8 \
   -nographic \
   -bios /usr/share/edk2-ovmf/x64/OVMF_CODE.fd \
   -device driver=e1000,netdev=n0 \

@@ -2,8 +2,8 @@
 //! about CPU topography and NUMA memory regions
 
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, Ordering, AtomicU8};
-use core::convert::TryInto;
+// use core::sync::atomic::{AtomicU32, Ordering, AtomicU8};
+// use core::convert::TryInto;
 use crate::mm::{self, PhysAddr};
 use crate::efi;
 // use alloc::vec::Vec;
@@ -17,11 +17,15 @@ pub const MAX_CORES: usize = 1024;
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct Rsdp {
-    signature:         [u8; 8],
-    checksum:          u8,
-    oem_id:            [u8; 6],
-    revision:          u8,
-    rsdt_addr:         u32,
+    signature:  [u8; 8],
+    checksum:   u8,
+    oem_id:     [u8; 6],
+    revision:   u8,
+    rsdt_addr:  u32,
+    length:     u32,
+    xsdt_addr:  u64,
+    extended_checksum: u8,
+    reversed: [u8; 3]
 }
 
 /// In-memory representation of an Extended RSDP ACPI structure
@@ -77,180 +81,109 @@ unsafe fn parse_header(addr: PhysAddr) -> (Header, PhysAddr, usize) {
 /// Initialize the ACPI subsystem. Mainly looking for APICs and memory maps.
 /// Brings up all cores on the system
 pub unsafe fn init() {
+    let rsdp_addr = efi::get_acpi_table().expect("Failed to get RSDP from EFI");
+    let rsdp = core::ptr::read_unaligned(rsdp_addr as *const Rsdp);
 
-    let rdsp = efi::get_acpi_table().expect("Failed to find ACPI table");
+    assert!(rsdp.revision >= 1, "Minimum ACPI version 2.0 required");
+    assert!(rsdp.length as usize >= size_of::<Rsdp>(), "RSP size invalid");
 
-    // Specification says we have to scan the first 1 KiB of the EBDA and the
-    // range from 0xe0000 to 0xfffff
 
-    // Get the pointer to the EBDA from the BDA
-    // let ebda = mm::read_phys::<u16>(PhysAddr(0x40e)) as u64;
+    let (xsdt, xsdt_payload, xsdt_size) = parse_header(PhysAddr(rsdp.xsdt_addr));
 
-    // // Compute the regions we need to scan for the RSDP
-    // let regions = [
-    //     // First 1 KiB of the EBDA
-    //     // (ebda, ebda + 1024 - 1),
+    assert!(&xsdt.signature == b"XSDT", "XSDT signature mismatch");
+    assert!((xsdt_size % size_of::<u64>()) == 0, "Invalid table size for XSDT");
 
-    //     // From 0xe0000 to 0xfffff
-    //     (0xe0000, 0xfffff)
-    // ];
-
-    // // Holds the RSDP structure if found
-    // let mut rsdp = None;
-
-    // 'rsdp_search: for &(start, end) in &regions {
-    //     // 16-byte align the start address upwards
-    //     let start = (start + 0xf) & !0xf;
-
-    //     // Go through each 16 byte offset in the range specified
-    //     for paddr in (start..=end).step_by(16) {
-    //         // Compute the end address of RSDP structure
-    //         let struct_end = start + size_of::<Rsdp>() as u64 - 1;
-
-    //         // Break out of the scan if we are out of bounds of this region
-    //         if struct_end > end {
-    //             break;
-    //         }
-
-    //         // Read the table
-    //         let table = mm::read_phys::<Rsdp>(PhysAddr(paddr));
-    //         if &table.signature != b"RSD PTR " {
-    //             continue;
-    //         }
-
-    //         // Read the tables bytes so we can checksum it
-    //         let table_bytes = mm::read_phys::
-    //             <[u8; size_of::<Rsdp>()]>(PhysAddr(paddr));
-
-    //         // Checksum the table
-    //         let sum = table_bytes.iter()
-    //             .fold(0u8, |acc, &x| acc.wrapping_add(x));
-    //         if sum != 0 {
-    //             continue;
-    //         }
-
-    //         // Checksum the extended RSDP if needed
-    //         if table.revision > 0 {
-    //             // Read the tables bytes so we can checksum it
-    //             const N: usize = size_of::<RsdpExtended>();
-    //             let extended_bytes = mm::read_phys::<[u8; N]>(PhysAddr(paddr));
-
-    //             // Checksum the table
-    //             let sum = extended_bytes.iter()
-    //                 .fold(0u8, |acc, &x| acc.wrapping_add(x));
-    //             if sum != 0 {
-    //                 continue;
-    //             }
-    //         }
-
-    //         rsdp = Some(table);
-    //         break 'rsdp_search;
-    //     }
-    // }
-
-    // // Get access to the RSDP
-    // let rsdp = rsdp.expect("Failed to find RSDP for ACPI");
-
-}
-    /*
-    // Parse out the RSDT
-    let (rsdt, rsdt_payload, rsdt_size) =
-        parse_header(PhysAddr(rsdp.rsdt_addr as u64));
-
-    // Check the signature and
-    assert!(&rsdt.signature == b"RSDT", "RSDT signature mismatch");
-    assert!((rsdt_size % size_of::<u32>()) == 0,
-        "Invalid table size for RSDT");
-    let rsdt_entries = rsdt_size / size_of::<u32>();
+    let xsdt_entries = xsdt_size / size_of::<u64>();
 
     // Set up the structures we're interested as parsing out as `None` as some
     // of them may or may not be present.
-    let mut apics          = None;
-    let mut apic_domains   = None;
-    let mut memory_domains = None;
+    // let mut apics          = None;
+    // let mut apic_domains   = None;
+    // let mut memory_domains = None;
 
     // Go through each table described by the RSDT
-    for entry in 0..rsdt_entries {
+    for entry in 0..xsdt_entries {
         // Get the physical address of the RSDP table entry
-        let entry_paddr = rsdt_payload.0 as usize + entry * size_of::<u32>();
+        let entry_paddr = xsdt_payload.0 as usize + entry * size_of::<u64>();
 
         // Get the pointer to the table
-        let table_ptr: u32 = mm::read_phys(PhysAddr(entry_paddr as u64));
+        let table_ptr: u64 = mm::read_phys(PhysAddr(entry_paddr as u64));
 
         // Get the signature for the table
         let signature: [u8; 4] = mm::read_phys(PhysAddr(table_ptr as u64));
 
         if &signature == b"APIC" {
             // Parse the MADT
-            assert!(apics.is_none(), "Multiple MADT ACPI table entries");
-            apics = Some(parse_madt(PhysAddr(table_ptr as u64)));
-        } else if &signature == b"SRAT" {
-            // Parse the SRAT
-            assert!(apic_domains.is_none() && memory_domains.is_none(),
-                "Multiple SRAT ACPI table entries");
-            let (ad, md) = parse_srat(PhysAddr(table_ptr as u64));
-            apic_domains   = Some(ad);
-            memory_domains = Some(md);
+            // assert!(apics.is_none(), "Multiple MADT ACPI table entries");
+            parse_madt(PhysAddr(table_ptr as u64));
         }
+            // // Parse the SRAT
+            // assert!(apic_domains.is_none() && memory_domains.is_none(),
+            //     "Multiple SRAT ACPI table entries");
+        else if &signature == b"SRAT" {
+            parse_srat(PhysAddr(table_ptr as u64));
+        }
+            // apic_domains   = Some(ad);
+            // memory_domains = Some(md);
     }
 
-    if let (Some(ad), Some(md)) = (apic_domains, memory_domains) {
-        // Register APIC to domain mappings
-        for (&apic, &node) in ad.iter() {
-            APIC_TO_DOMAIN[apic as usize].store(node.try_into().unwrap(),
-                Ordering::Relaxed);
-        }
+    // if let (Some(ad), Some(md)) = (apic_domains, memory_domains) {
+    //     // Register APIC to domain mappings
+    //     for (&apic, &node) in ad.iter() {
+    //         APIC_TO_DOMAIN[apic as usize].store(node.try_into().unwrap(),
+    //             Ordering::Relaxed);
+    //     }
 
-        // Notify the memory manager of the known APIC -> NUMA mappings
-        crate::mm::register_numa_nodes(ad, md);
-    }
+    //     // Notify the memory manager of the known APIC -> NUMA mappings
+    //     crate::mm::register_numa_nodes(ad, md);
+    // }
 
-    // Set the total core count based on the number of detected APICs on the
-    // system. If no APICs were mentioned by ACPI, then we can simply say there
-    // is only one core.
-    TOTAL_CORES.store(apics.as_ref().map(|x| x.len() as u32).unwrap_or(1),
-                      Ordering::SeqCst);
+    // // Set the total core count based on the number of detected APICs on the
+    // // system. If no APICs were mentioned by ACPI, then we can simply say there
+    // // is only one core.
+    // TOTAL_CORES.store(apics.as_ref().map(|x| x.len() as u32).unwrap_or(1),
+    //                   Ordering::SeqCst);
 
-    // Initialize the state of all the known APICs
-    if let Some(apics) = &apics {
-        for &apic_id in apics {
-            APICS[apic_id as usize].store(ApicState::Offline as u8,
-                                          Ordering::SeqCst);
-        }
-    }
+    // // Initialize the state of all the known APICs
+    // if let Some(apics) = &apics {
+    //     for &apic_id in apics {
+    //         APICS[apic_id as usize].store(ApicState::Offline as u8,
+    //                                       Ordering::SeqCst);
+    //     }
+    // }
 
-    // Set that our core is online
-    APICS[core!().apic_id().unwrap() as usize]
-        .store(ApicState::Online as u8, Ordering::SeqCst);
+    // // Set that our core is online
+    // APICS[core!().apic_id().unwrap() as usize]
+    //     .store(ApicState::Online as u8, Ordering::SeqCst);
 
-    // Launch all other cores
-    if let Some(valid_apics) = apics {
-        // Get exclusive access to the APIC for this core
-        let mut apic = core!().apic().lock();
-        let apic = apic.as_mut().unwrap();
+    // // Launch all other cores
+    // if let Some(valid_apics) = apics {
+    //     // Get exclusive access to the APIC for this core
+    //     let mut apic = core!().apic().lock();
+    //     let apic = apic.as_mut().unwrap();
 
-        // Go through all APICs on the system
-        for apic_id in valid_apics {
-            // We don't want to start ourselves
-            if core!().apic_id().unwrap() == apic_id { continue; }
+    //     // Go through all APICs on the system
+    //     for apic_id in valid_apics {
+    //         // We don't want to start ourselves
+    //         if core!().apic_id().unwrap() == apic_id { continue; }
 
-            // Mark the core as launched
-            set_core_state(apic_id, ApicState::Launched);
+    //         // Mark the core as launched
+    //         set_core_state(apic_id, ApicState::Launched);
 
-            // Launch the core
-            apic.ipi(apic_id, 0x4500);
-            apic.ipi(apic_id, 0x4608);
-            apic.ipi(apic_id, 0x4608);
+    //         // Launch the core
+    //         apic.ipi(apic_id, 0x4500);
+    //         apic.ipi(apic_id, 0x4608);
+    //         apic.ipi(apic_id, 0x4608);
 
-            // Wait for the core to come online
-            while core_state(apic_id) != ApicState::Online {}
-        }
-    }
+    //         // Wait for the core to come online
+    //         while core_state(apic_id) != ApicState::Online {}
+    //     }
+    // }
 }
 
 /// Parse the MADT out of the ACPI tables
 /// Returns a vector of all usable APIC IDs
-unsafe fn parse_madt(ptr: PhysAddr) -> Vec<u32> {
+unsafe fn parse_madt(ptr: PhysAddr) {
     // Parse the MADT header
     let (_header, payload, size) = parse_header(ptr);
 
@@ -260,7 +193,7 @@ unsafe fn parse_madt(ptr: PhysAddr) -> Vec<u32> {
     let end = payload.0 + size as u64;
 
     // Create a new structure to hold the APICs that are usable
-    let mut apics = Vec::new();
+    // let mut apics = Vec::new();
 
     loop {
         /// Processor is ready for use
@@ -294,7 +227,8 @@ unsafe fn parse_madt(ptr: PhysAddr) -> Vec<u32> {
                 // a valid APIC
                 if (flags & APIC_ENABLED) != 0 ||
                         (flags & APIC_ONLINE_CAPABLE) != 0 {
-                    apics.push(apic_id as u32);
+                            print!("found lapic {:#x}\n", apic_id);
+                    // apics.push(apic_id as u32);
                 }
             }
             9 => {
@@ -309,7 +243,7 @@ unsafe fn parse_madt(ptr: PhysAddr) -> Vec<u32> {
                 // a valid APIC
                 if (flags & APIC_ENABLED) != 0 ||
                         (flags & APIC_ONLINE_CAPABLE) != 0 {
-                    apics.push(apic_id);
+                    // apics.push(apic_id);
                 }
             }
             _ => {
@@ -321,13 +255,12 @@ unsafe fn parse_madt(ptr: PhysAddr) -> Vec<u32> {
         ics = PhysAddr(ics.0 + len as u64);
     }
 
-    apics
+    // apics
 }
 
 /// Parse the SRAT out of the ACPI tables
 /// Returns a tuple of (apic -> domain, memory domain -> phys_ranges)
-unsafe fn parse_srat(ptr: PhysAddr) ->
-        (BTreeMap<u32, u32>, BTreeMap<u32, RangeSet>) {
+unsafe fn parse_srat(ptr: PhysAddr) {
     // Parse the SRAT header
     let (_header, payload, size) = parse_header(ptr);
 
@@ -336,11 +269,11 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
     let end = payload.0 + size as u64;
 
     // Mapping of proximity domains to their memory ranges
-    let mut memory_affinities:
-        BTreeMap<u32, RangeSet> = BTreeMap::new();
+    // let mut memory_affinities:
+    //     BTreeMap<u32, RangeSet> = BTreeMap::new();
 
     // Mapping of APICs to their proximity domains
-    let mut apic_affinities: BTreeMap<u32, u32> = BTreeMap::new();
+    // let mut apic_affinities: BTreeMap<u32, u32> = BTreeMap::new();
 
     loop {
         /// The entry is enabled and present. Some BIOSes may staticially
@@ -377,8 +310,9 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
 
                 // Log the affinity record
                 if (flags & FLAGS_ENABLED) != 0 {
-                    assert!(apic_affinities.insert(apic_id as u32, domain)
-                            .is_none(), "Duplicate LAPIC affinity domain");
+                    print!("APIC {:x} -> domain {:#x}\n", apic_id, domain);
+                    // assert!(apic_affinities.insert(apic_id as u32, domain)
+                    //         .is_none(), "Duplicate LAPIC affinity domain");
                 }
             }
             1 => {
@@ -396,13 +330,18 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
                 if size > 0 {
                     // Log the affinity record
                     if (flags & FLAGS_ENABLED) != 0 {
-                        memory_affinities.entry(domain).or_insert_with(|| {
-                            RangeSet::new()
-                        }).insert(Range {
-                            start: base.0,
-                            end:   base.0.checked_add(size.checked_sub(1)
-                                                      .unwrap()).unwrap()
-                        });
+
+                        print!("Domain {:x} -> {:#x}-{:#x}\n",
+                               domain,
+                               base.0,
+                               base.0 + (size - 1));
+                        // memory_affinities.entry(domain).or_insert_with(|| {
+                        //     RangeSet::new()
+                        // }).insert(Range {
+                        //     start: base.0,
+                        //     end:   base.0.checked_add(size.checked_sub(1)
+                        //                               .unwrap()).unwrap()
+                        // });
                     }
                 }
             }
@@ -417,8 +356,9 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
 
                 // Log the affinity record
                 if (flags & FLAGS_ENABLED) != 0 {
-                    assert!(apic_affinities.insert(apic_id, domain)
-                            .is_none(), "Duplicate APIC affinity domain");
+                        print!("APIC {:x} -> domain {:#x}\n", apic_id, domain);
+                    // assert!(apic_affinities.insert(apic_id, domain)
+                    //         .is_none(), "Duplicate APIC affinity domain");
                 }
             }
             _ => {
@@ -429,6 +369,4 @@ unsafe fn parse_srat(ptr: PhysAddr) ->
         sra = PhysAddr(sra.0 + len as u64);
     }
 
-    (apic_affinities, memory_affinities)
 }
-*/
