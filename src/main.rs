@@ -38,7 +38,7 @@ system_table: *mut EfiSystemTable) -> EfiStatus {
     efi::get_memory_map(image_handle);
 
     unsafe {
-        acpi::init();
+        acpi::init().unwrap();
     }
 
     panic!("the EFI is escaping!");

@@ -13,114 +13,275 @@ use crate::efi;
 pub const MAX_CORES: usize = 1024;
 
 
+/// result types which wraps ACPI error
+type Result<T> = core::result::Result<T, Error>;
+
+
+/// Different types of ACPI table, for error info
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+pub enum TableType {
+    Rsdp,
+    RsdpExtended,
+    Xsdt,
+    Unknown([u8; 4]),
+}
+
+
+impl From<[u8; 4]> for TableType {
+    fn from(val: [u8; 4]) -> Self {
+        match &val {
+            b"XSDT" => Self::Xsdt,
+            _       => Self::Unknown(val),
+        }
+    }
+}
+
+
+
+/// Errors from ACPI table parsing
+#[derive(Debug)]
+pub enum Error {
+    /// ACPI table not reported by UEFI
+    RsdpNotFound,
+
+    /// some ACPI table had an invalid checksum
+    ChecksumMismatch(TableType),
+
+    /// An ACPI table did not match correct signature
+    SignatureMismatch(TableType),
+
+    /// Extended RSDP was attempted to be accessed, but ACPI 2.0 not supported
+    RevisionTooOld,
+
+    /// ACPI did not match the expected length
+    LengthMismatch(TableType),
+
+    /// XSDT table size was not evenly divisible by array element size
+    XsdtBadEntries,
+
+    /// An integer overflow occurred
+    IntegerOverflow,
+
+}
+
+
 /// In-memory representation of an RSDP ACPI structure
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
 struct Rsdp {
+    // "RSD PTR "
     signature:  [u8; 8],
     checksum:   u8,
     oem_id:     [u8; 6],
     revision:   u8,
     rsdt_addr:  u32,
-    length:     u32,
-    xsdt_addr:  u64,
-    extended_checksum: u8,
-    reversed: [u8; 3]
+}
+
+/// Root System Description Pointer for getting the RSDT/XSDT
+impl Rsdp {
+    /// Load an RSDP struct from `addr`
+    unsafe fn from_addr(addr: PhysAddr) -> Result<Self> {
+        // Validate the checksum
+        checksum(addr, size_of::<Self>(), TableType::Rsdp)?;
+
+        // read base RSDP struct
+        let rsdp = mm::read_phys::<Self>(addr);
+
+        // check signature
+        if &rsdp.signature != b"RSD PTR " {
+            return Err(Error::SignatureMismatch(TableType::Rsdp));
+        }
+
+        // looks good, return rsdp
+        Ok(rsdp)
+    }
 }
 
 /// In-memory representation of an Extended RSDP ACPI structure
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
 struct RsdpExtended {
-    descriptor:        Rsdp,
+    base:              Rsdp,
     length:            u32,
     xsdt_addr:         u64,
     extended_checksum: u8,
     reserved:          [u8; 3],
 }
 
-impl Rsdp {
-    /// Load an RSDP struct from `addr`
-    unsafe fn from_addr(addr: PhysAddr) -> Result<Self> {
-        // read base RSDP struct
-        let rsdp = mm::read_phys::<Rsdp>(addr);
-
-        Ok(rsdp)
-    }
-}
-
-
 impl RsdpExtended {
     /// Load an Extended RSDP struct from `addr`
     unsafe fn from_addr(addr: PhysAddr) -> Result<Self> {
-        // read base RSDP struct
-        panic!();
-        // let rsdp = mm::read_phys<RsdpExtended>(addr);
-        let rsdp = mm::read_phys::<Rsdp>(addr);
+        // read RSDP for ACPI 1.0 structure
+        // this extended RSDP requires ACPI 2.0
+        let rsdp = Rsdp::from_addr(addr)?;
+
+        if rsdp.revision < 2 {
+            return Err(Error::RevisionTooOld);
+        }
+
+        print!("{:#x?}", rsdp);
+        checksum(addr, size_of::<Self>(), TableType::RsdpExtended)?;
+
+
+        let rsdp = mm::read_phys::<Self>(addr);
+
+        // check the size
+        if rsdp.length as usize != size_of::<Self>() {
+            return Err(Error::LengthMismatch(TableType::RsdpExtended));
+        }
+
+        // looks good, return rsdp
+        Ok(rsdp)
+
     }
 }
 
 
+
+/// Get a fixed size table from
+// unsafe fn get_fixed_table<T>(addr: PhysAddr, typ: TableType) -> Result<T>{
+//     let table = mm::read_phys::<T>(addr);
+//     checksum(addr, size_of::<T>(), typ)?;
+
+//     Ok(table)
+
+// }
+
+/// Compute ACPI checksum on physical memory
+unsafe fn checksum(addr: PhysAddr, size: usize, typ: TableType) -> Result<()> {
+
+    // Compute checksum
+    let chk = (0..size as u64).try_fold(0u8, |acc, offset| {
+        Ok(acc.wrapping_add(
+            mm::read_phys::<u8>(PhysAddr(addr.0.checked_add(offset)
+            .ok_or(Error::IntegerOverflow)?))))
+    })?;
+
+    // Validate checksum
+    if chk == 0 {
+        Ok(())
+    } else {
+        return Err(Error::ChecksumMismatch(typ));
+    }
+}
+
 /// In-memory representation of an ACPI table header
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
-struct Header {
+struct Table {
+    /// ASCI string representation of table identifier
     signature:        [u8; 4],
+    /// length of table and header in bytes
     length:           u32,
+    /// version of table used
     revision:         u8,
+    /// entire table must add to 0 to be valid
     checksum:         u8,
+    /// identifies the OEM
     oemid:            [u8; 6],
+    /// identifier for the OEM's particular data table
     oem_table_id:     u64,
+    /// OEM revision number
     oem_revision:     u32,
+    /// vendor identifier for creator of this table
     creator_id:       u32,
+    /// vendor revision number
     creator_revision: u32,
+}
+
+impl Table {
+    /// Gets the requested table if available at `addr`, or returns None
+    /// Return header, type of table, address of contents, content length
+    unsafe fn from_addr(addr: PhysAddr)
+                        -> Result<(Self, TableType, PhysAddr, usize)> {
+
+        let table = mm::read_phys::<Self>(addr);
+
+        let typ = TableType::from(table.signature);
+
+        // Validate the checksum
+        checksum(addr, table.length as usize, typ)?;
+
+        let header_size = size_of::<Self>();
+        let payload_size = (table.length as usize).checked_sub(header_size)
+            .ok_or(Error::LengthMismatch(typ))?;
+        let payload_addr = PhysAddr(addr.0 + header_size as u64);
+        let payload_addr = PhysAddr(addr.0.checked_add(header_size as u64)
+            .ok_or(Error::IntegerOverflow)?);
+
+
+        Ok((table, typ, payload_addr, payload_size))
+    }
 }
 
 /// Parse a standard ACPI table header. This will parse out the header,
 /// validate the checksum and length, and return a physical address and size
 /// of the payload following the header.
-unsafe fn parse_header(addr: PhysAddr) -> (Header, PhysAddr, usize) {
-    // Read the header
-    let head = mm::read_phys::<Header>(addr);
+// unsafe fn parse_header(addr: PhysAddr) -> (Header, PhysAddr, usize) {
+//     // Read the header
+//     let head = mm::read_phys::<Header>(addr);
 
-    // Get the number of bytes for the table
-    let payload_len = head.length
-        .checked_sub(size_of::<Header>() as u32)
-        .expect("Integer underflow on table length");
+//     // Get the number of bytes for the table
+//     let payload_len = head.length
+//         .checked_sub(size_of::<Header>() as u32)
+//         .expect("Integer underflow on table length");
 
-    // Check the checksum for the table
-    let sum = (addr.0..addr.0 + head.length as u64)
-        .fold(0u8, |acc, paddr| {
-            acc.wrapping_add(mm::read_phys(PhysAddr(paddr as u64)))
-        });
-    assert!(sum == 0, "Table checksum invalid {:?}",
-            core::str::from_utf8(&head.signature));
+//     // Check the checksum for the table
+//     let sum = (addr.0..addr.0 + head.length as u64)
+//         .fold(0u8, |acc, paddr| {
+//             acc.wrapping_add(mm::read_phys(PhysAddr(paddr as u64)))
+//         });
+//     assert!(sum == 0, "Table checksum invalid {:?}",
+//             core::str::from_utf8(&head.signature));
 
-    // Return the parsed header
-    (head, PhysAddr(addr.0 + size_of::<Header>() as u64), payload_len as usize)
-}
+//     // Return the parsed header
+//     (head, PhysAddr(addr.0 + size_of::<Header>() as u64), payload_len as usize)
+// }
 
-/// result types which wraps ACPI error
-type Result<T> = core::result::Result<T, Error>;
-
-
-/// Errors from ACPI table parsing
-pub enum Error {
-    /// ACPI table not reported by UEFI
-    RsdpNotFound,
-}
-
-/// Initialize the ACPI subsystem. Mainly looking for APICs and memory maps.
-/// Brings up all cores on the system
+/// Initialize the ACPI subsystem
 pub unsafe fn init() -> Result<()> {
-
-
 
     let rsdp_addr = efi::get_acpi_table()
         .ok_or(Error::RsdpNotFound)?;
-    // let rsdp = core::ptr::read_unaligned(rsdp_addr as *const Rsdp);
 
     let rsdp = RsdpExtended::from_addr(PhysAddr(rsdp_addr as u64))?;
+
+    let (_, typ, xsdt, len) = Table::from_addr(PhysAddr(rsdp.xsdt_addr))?;
+    if typ != TableType::Xsdt {
+        return Err(Error::SignatureMismatch(TableType::Xsdt));
+    }
+
+    // Make sure XSDT size is modulo a 64-bit addr size
+    if len % size_of::<u64>() != 0 {
+        return Err(Error::XsdtBadEntries);
+    }
+
+    // get num entries in XSDT
+    let entries = len / size_of::<u64>();
+
+    for idx in 0..entries {
+        // read the table ptr from XSDT
+        let entry_addr = idx.checked_mul(size_of::<u64>()).and_then(|x| {
+            x.checked_add(xsdt.0 as usize)
+        }).ok_or(Error::IntegerOverflow)?;
+
+        // Get table addr by reading XSDT entry
+        // Observed in OVMF
+        let table_addr = mm::read_phys_unaligned::<u64>(
+            PhysAddr(entry_addr as u64));
+
+
+        let (_, typ, data, len) = Table::from_addr(PhysAddr(table_addr))?;
+
+        print!("{:?} {}\n", typ, len);
+    }
+
+
+
+
+
+    print!("{:#x?}\n", xsdt);
+
 
     Ok(())
 }
