@@ -4,7 +4,8 @@
 use core::mem::size_of;
 // use core::sync::atomic::{AtomicU32, Ordering, AtomicU8};
 // use core::convert::TryInto;
-use crate::mm::{self, PhysAddr};
+
+use crate::mm::{self, PhysAddr, PhysSlice};
 use crate::efi;
 // use alloc::vec::Vec;
 // use alloc::collections::BTreeMap;
@@ -20,9 +21,19 @@ type Result<T> = core::result::Result<T, Error>;
 /// Different types of ACPI table, for error info
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 pub enum TableType {
+    /// root system description table
     Rsdp,
+    /// extended (ACPI 2.0) root system description table
     RsdpExtended,
+    /// extended system description table
     Xsdt,
+    /// multiple APIC description table
+    Madt,
+
+    /// system resource affinity table
+    Srat,
+
+    /// Unknown table type
     Unknown([u8; 4]),
 }
 
@@ -31,6 +42,8 @@ impl From<[u8; 4]> for TableType {
     fn from(val: [u8; 4]) -> Self {
         match &val {
             b"XSDT" => Self::Xsdt,
+            b"APIC" => Self::Madt,
+            b"SRAT" => Self::Srat,
             _       => Self::Unknown(val),
         }
     }
@@ -214,6 +227,97 @@ impl Table {
     }
 }
 
+struct Madt;
+
+impl Madt {
+    /// parse MADT given addr of start of MADT and its size
+    unsafe fn from_addr(addr: PhysAddr, size: usize) -> Result<Self> {
+
+        // error type when MADT is truncated
+        const E: Error = Error::LengthMismatch(TableType::Madt);
+
+        let mut slice = mm::PhysSlice::new(addr, size);
+
+        // read local APIC physical address
+        let local_apic_addr = slice.consume::<u32>().map_err(|_| E)?;
+
+        // get the APIC flags
+        let flags = slice.consume::<u32>().map_err(|_| E)?;
+
+        // handle interrupt controller structures
+        while slice.len() > 0 {
+            // Read the interrupt controller structur header
+            let typ = slice.consume::<u8>().map_err(|_| E)?;
+            let len = slice.consume::<u8>().map_err(|_| E)?
+                .checked_sub(2).ok_or(E)?;
+
+            match typ {
+                0 => {
+                    // Processor Local APIC structure
+                    #[derive(Debug)]
+                    #[repr(C, packed)]
+                    struct LocalApic {
+                        /// the processor's device object id evaluates to this
+                        /// when this LAPIC is associated w/ that processor
+                        acpi_processor_uid: u8,
+                        /// processor's local APIC id
+                        apic_id: u8,
+                        /// local APIC flags
+                        ///
+                        /// Bit 0: Enabled (set if ready for use)
+                        /// Bit 1: Online capable (RAZ is enabled, indicates if
+                        /// the APIC can be enabled at runtime
+                        flags: u32,
+                    }
+
+                    if len as usize != size_of::<LocalApic>() {
+                        return Err(E);
+                    }
+
+                    let apic = slice.consume::<LocalApic>().map_err(|_| E)?;
+
+                    print!("{:#x?}\n", apic);
+
+                }
+                9 => {
+                    /// Processor Local x2APIC Structure
+                    /// x2APIC has more maximum processors (up to 2^32-16)
+                    /// QEMU does not natively support x2APIC, but KVM will
+                    /// emulate it when enabled
+                    #[derive(Debug)]
+                    #[repr(C, packed)]
+                    struct LocalX2Apic {
+                        reserved: u16,
+                        x2apic_id: u32,
+                        flags: u32,
+                        acpi_processor_uid: u32,
+                    }
+
+                    if len as usize != size_of::<LocalX2Apic>() {
+                        return Err(E);
+                    }
+
+                    let apic = slice.consume::<LocalX2Apic>().map_err(|_| E)?;
+
+                    print!("{:#x?}\n", apic);
+
+                }
+                _ => {
+                    // unknown type, discard data
+                    slice.discard(len as usize).map_err(|_| E)?;
+                }
+            }
+
+            print!("{:#x} {}\n", typ, len);
+
+
+
+        }
+
+        Ok(Self)
+    }
+}
+
 /// Parse a standard ACPI table header. This will parse out the header,
 /// validate the checksum and length, and return a physical address and size
 /// of the payload following the header.
@@ -273,14 +377,21 @@ pub unsafe fn init() -> Result<()> {
 
         let (_, typ, data, len) = Table::from_addr(PhysAddr(table_addr))?;
 
-        print!("{:?} {}\n", typ, len);
+        match typ {
+            TableType::Madt => {
+                Madt::from_addr(data, len)?;
+            }
+
+            // unknown
+            _ => {}
+        }
     }
 
 
 
 
 
-    print!("{:#x?}\n", xsdt);
+    // print!("{:#x?}\n", xsdt);
 
 
     Ok(())
